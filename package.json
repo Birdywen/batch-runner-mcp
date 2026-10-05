@@ -1,0 +1,42 @@
+{
+  "name": "batch-runner-mcp",
+  "version": "1.0.0",
+  "description": "Batch bash runner for MCP: run several steps in one call, each with a mechanical expect check; plus read/grep/edit/undo/sqlite/artifact tools. Zero npm deps.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs && node tools-ext.greptt.test.mjs && node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs",
+    "test:guard": "node batch-guard.test.mjs",
+    "test:tools": "node tools-ext.test.mjs && node tools-ext.greptt.test.mjs",
+    "test:flow": "node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs"
+  },
+  "bin": {
+    "batch-runner-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "server-http.mjs",
+    "tools-ext.mjs",
+    "batch-guard.mjs",
+    "omega-flow.mjs",
+    "omega-flow-wait.mjs",
+    "README.md",
+    "OMEGA-FLOW.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Birdywen/batch-runner-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "bash",
+    "batch",
+    "agent",
+    "claude-code",
+    "opencode"
+  ],
+  "license": "MIT"
+}
