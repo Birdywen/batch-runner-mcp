@@ -94,9 +94,9 @@
 
 ## 权限边界
 
-默认仅允许 read/grep/guard_check/health/quota/sqlite、batch_status、artifact_read/search。
+默认仅允许 read/grep/guard_check/health/sqlite、batch_status、artifact_read/search。
 编辑、撤销、batch 和 batch_cancel 必须同时满足服务端环境开关和请求 allowEffects 清单。
-`db_query`、`vfs_local_write`、`run_process` 不在白名单内。
+`vfs_local_write` 不在白名单内。
 
 **MCP host 只对 `omega_flow` 这个入口授权，不会重新对内部工具逐项授权。**
 这是聚合权限，不是自动继承调用者的 `edit:deny`。如果开启效果工具，必须限制哪些 agent

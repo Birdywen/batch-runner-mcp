@@ -16,7 +16,7 @@ import { inspectCommand } from './batch-guard.mjs';
 const TOOLS_EXT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools-ext.mjs');
 import {
   vfsLocalWrite, omegaBatch, omegaBatchStatus, omegaBatchCancel,
-  omegaEdit, omegaUndo, omegaRead, omegaGrep, dbQuery, EXTRA_TOOLS,
+  omegaEdit, omegaUndo, omegaRead, omegaGrep, EXTRA_TOOLS,
 } from './tools-ext.mjs';
 
 let pass = 0;
@@ -26,20 +26,20 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
 
 // ---- omega_batch: structured status, failure classes, and cancellation ----
 {
-  const started = await omegaBatch({ steps: [
+  const started = await omegaBatch({ waitMs: 0, steps: [
     { label: 'accepted', command_line: 'unused', expect: { contains: ['TOKEN'] } },
   ] }, async () => ({ isError: false, text: 'TOKEN\n' }));
-  const id = /batch started: (job-[a-z0-9-]+)/.exec(started.text)?.[1];
+  const id = started.data?.jobId;
   const status = await omegaBatchStatus({ id, waitMs: 1000, format: 'json' });
   const parsed = JSON.parse(status.text);
   ok(!status.isError && parsed.state === 'success', 'omega_batch JSON status must report success');
   ok(parsed.results[0].status === 'passed' && parsed.results[0].failureType === null, 'omega_batch JSON status must expose structured step fields');
 
-  const partialStart = await omegaBatch({ stopOnError: false, steps: [
+  const partialStart = await omegaBatch({ waitMs: 0, stopOnError: false, steps: [
     { label: 'bad assertion', command_line: 'unused', expect: { contains: ['MISSING_TOKEN'] } },
     { label: 'continues', command_line: 'unused' },
   ] }, async () => ({ isError: false, text: 'ordinary output' }));
-  const partialId = /batch started: (job-[a-z0-9-]+)/.exec(partialStart.text)?.[1];
+  const partialId = partialStart.data?.jobId;
   const partialStatus = await omegaBatchStatus({ id: partialId, waitMs: 1000, format: 'json' });
   const partial = JSON.parse(partialStatus.text);
   ok(partialStatus.isError && partial.state === 'partial', 'a continued batch with a failed step must still return isError');
@@ -47,11 +47,11 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
 
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
-  const cancelStart = await omegaBatch({ steps: [
+  const cancelStart = await omegaBatch({ waitMs: 0, steps: [
     { label: 'active', command_line: 'unused' },
     { label: 'must not start', command_line: 'unused' },
   ] }, async () => gate);
-  const cancelId = /batch started: (job-[a-z0-9-]+)/.exec(cancelStart.text)?.[1];
+  const cancelId = cancelStart.data?.jobId;
   const cancel = omegaBatchCancel({ id: cancelId });
   release({ isError: false, text: 'active finished' });
   const cancelledStatus = await omegaBatchStatus({ id: cancelId, waitMs: 1000, format: 'json' });
@@ -87,7 +87,7 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
   const r = omegaEdit({ edits: [
     { path: f, oldString: 'one', newString: 'ONE' },
     { path: f, oldString: 'two', newString: 'TWO-CHAINED' },
-  ] });
+  ], diff: true });
   ok(!r.isError, 'chained same-file edits must succeed: ' + r.text);
   ok(readFileSync(f, 'utf8') === 'ONE\nTWO-CHAINED\nthree\n',
     'both edits must survive, later one seeing the earlier: got ' + JSON.stringify(readFileSync(f, 'utf8')));
@@ -211,7 +211,7 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
   writeFileSync(f, 'original\n');
   const r = omegaEdit({ edits: [{ path: f, oldString: 'original', newString: 'changed' }] });
   ok(!r.isError, 'edit before undo must succeed');
-  const m = /undo point: (edit-[a-z0-9-]+)/.exec(r.text);
+  const m = /undo (edit-[a-z0-9-]+)/.exec(r.text);
   ok(!!m, 'edit result must report an undo point id, got: ' + r.text);
   if (m) {
     ok(readFileSync(f, 'utf8') === 'changed\n', 'file must be changed before undo, got ' + readFileSync(f, 'utf8'));
@@ -223,7 +223,7 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
   }
   const created = path.join(scratch, 'undo-created.txt');
   const rc = omegaEdit({ createIfMissing: true, edits: [{ path: created, oldString: '', newString: 'temp\n' }] });
-  const mc = /undo point: (edit-[a-z0-9-]+)/.exec(rc.text);
+  const mc = /undo (edit-[a-z0-9-]+)/.exec(rc.text);
   ok(!!mc, 'create edit must also report an undo point');
   if (mc) {
     ok(existsSync(created), 'created file must exist before undo');
@@ -317,86 +317,13 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
   }
 }
 
-// ---- db_query dryRun must NOT write (write-enabled build only) ----
-// Regression: the first write-enabled build answered dryRun with "NOTHING
-// WRITTEN" while actually calling run(), so the statement executed. The probe
-// below is an UPDATE whose WHERE matches no row, so even a regressed build
-// changes 0 rows -- the test proves dry-run behaviour without dirtying the
-// asset store, and the row count is the assertion that it stayed put.
-// Oracle runs the read-only build, where these writes are refused outright; it
-// asserts the fence instead.
-const dbDefForTests = EXTRA_TOOLS.find((t) => t.name === 'db_query');
-const dbWriteEnabled = !!(dbDefForTests && dbDefForTests.inputSchema.properties.dryRun);
-if (dbWriteEnabled) {
-  const countRows = async () => {
-    const r = await dbQuery({ sql: 'SELECT count(*) FROM memory;' });
-    return (r.text || '').trim();
-  };
-  const before = await countRows();
-  const dry = await dbQuery({
-    sql: "UPDATE memory SET content = 'DRYRUN_PROBE' WHERE key = '__omega_no_such_key__';",
-    dryRun: true,
-  });
-  ok(!dry.isError, 'db_query dryRun on a valid write must not error: ' + dry.text.slice(0, 200));
-  ok(/NOTHING WRITTEN/i.test(dry.text), 'db_query dryRun must label itself NOTHING WRITTEN');
-  ok(!/WRITE ok=/.test(dry.text), 'db_query dryRun must NOT report a write receipt');
-  const after = await countRows();
-  ok(before === after, `db_query dryRun must not change row count (${before} -> ${after})`);
-
-  // The fence itself: a non-whitelisted table is refused with no snapshot taken.
-  const denied = await dbQuery({ sql: 'INSERT INTO sqlite_master_does_not_exist (a) VALUES (1);' });
-  ok(denied.isError, 'db_query must refuse a table outside the whitelist');
-  ok(!/WRITE ok=/.test(denied.text), 'a refused write must not produce a write receipt');
-  // DDL stays refused unconditionally, snapshot or not.
-  const ddl = await dbQuery({ sql: 'DROP TABLE memory;' });
-  ok(ddl.isError, 'db_query must refuse DROP even with a snapshot path available');
-  ok(/never allowed/i.test(ddl.text), 'the DDL refusal must say it is unconditional');
-} else {
-  // Read-only build (Oracle): every write class is refused by the same fence,
-  // and no write receipt may ever appear.
-  for (const [label, sql] of [
-    ['INSERT', "INSERT INTO memory (slot, key, content) VALUES ('x','y','z');"],
-    ['UPDATE', "UPDATE memory SET content = 'probe';"],
-    ['DELETE', 'DELETE FROM memory;'],
-    ['DROP', 'DROP TABLE memory;'],
-    ['PRAGMA assignment', 'PRAGMA journal_mode = WAL;'],
-    ['VACUUM', 'VACUUM;'],
-  ]) {
-    const r = await dbQuery({ sql });
-    ok(r.isError, `read-only db_query must refuse ${label}`);
-    ok(!/WRITE ok=/.test(r.text), `read-only db_query must not emit a write receipt for ${label}`);
-  }
-  const read = await dbQuery({ sql: 'SELECT count(*) FROM memory;' });
-  if (/db_query not configured/.test(read.text)) {
-    console.log('  (db_query SELECT skipped: no dbfile.cjs on this host)');
-    ok(read.isError, 'unconfigured db_query must report an error, not pretend success');
-  } else {
-    ok(!read.isError, 'read-only db_query must still allow SELECT');
-  }
-}
-
 // ---- tool registry sanity ----
-// The two hosts DIVERGE on db_query by design: Mac runs the write-enabled build
-// (DML + whitelist + auto .backup), Oracle keeps the original read-only build
-// because its db_query is maintained separately there. The suite detects which
-// build it is running against and asserts the right contract for each, so one
-// file can guard both hosts instead of forking.
 {
   const names = EXTRA_TOOLS.map((t) => t.name);
-  for (const n of ['omega_undo', 'db_query', 'omega_edit', 'omega_batch_status', 'omega_batch_cancel', 'omega_grep']) {
+  for (const n of ['omega_edit', 'omega_batch', 'omega_batch_status', 'omega_grep', 'omega_read']) {
     ok(names.includes(n), `EXTRA_TOOLS must advertise ${n}`);
   }
-  const dbDef = EXTRA_TOOLS.find((t) => t.name === 'db_query');
-  const writeEnabled = !!(dbDef && dbDef.inputSchema.properties.dryRun);
-  if (writeEnabled) {
-    ok(/refused/i.test(dbDef.description) && /backup/i.test(dbDef.description),
-      'write-enabled db_query must state the fence and the snapshot');
-    ok(/snapshot|backup/i.test(dbDef.description), 'write-enabled db_query must document the snapshot');
-  } else {
-    ok(/Writes are refused\./.test(dbDef.description),
-      'read-only db_query must still say writes are refused');
-    ok(!dbDef.inputSchema.properties.dryRun, 'read-only db_query must not advertise dryRun');
-  }
+  for (const gone of ['db_query', 'omega_quota', 'omega_undo', 'omega_batch_cancel', 'omega_guard_check']) ok(!names.includes(gone), `${gone} must stay removed`);
   for (const t of EXTRA_TOOLS) {
     if (t.name === 'omega_undo') ok(t.inputSchema.required.includes('batchId'), 'omega_undo must require batchId');
     if (t.name === 'omega_edit') {
@@ -418,7 +345,6 @@ if (dbWriteEnabled) {
     }
     ok(typeof t.description === 'string' && t.description.length > 0, `${t.name} must carry a non-empty description`);
   }
-  console.log(`  (db_query build on this host: ${writeEnabled ? 'write-enabled' : 'read-only'})`);
 }
 
 // ---- guard still refuses after the false-positive fix ----
@@ -427,8 +353,8 @@ ok(inspectCommand('node -e "x => x"').ok, 'guard must allow an arrow function');
 ok(inspectCommand('echo x > /tmp/f').ok, 'guard must allow /tmp');
 
 // ---- the tool PATH self-heal, exercised under the PATH that actually broke it ----
-// GenCode's server env is bundled-resources/bin + system dirs, with no Homebrew
-// prefix, so every `rg` probe failed. Assert the invariant directly rather than
+// Hosts may start the server with only system dirs on PATH (no Homebrew
+// prefix), so every `rg` probe would fail. Assert the invariant directly rather than
 // trusting the ambient shell: importing the module under a stripped PATH must
 // still leave the tool dirs reachable. This runs in a child because the parent
 // already fixed its own PATH at import time.

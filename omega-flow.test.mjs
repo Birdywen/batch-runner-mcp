@@ -122,7 +122,7 @@ test('real batch guard and structured job ID compose; launch alone is not a comp
 test('MCP wire advertises flow alongside old tools, with read-only default', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'omega-flow-wire-'));
   const child = spawn(process.execPath, [new URL('./server.mjs', import.meta.url).pathname], {
-    env: { ...process.env, OMEGA_FLOW_ALLOW_EFFECTS: '0', OMEGA_MCP_LOG: path.join(dir, 'log') },
+    env: { ...process.env, OMEGA_FLOW: '1', OMEGA_FLOW_ALLOW_EFFECTS: '0', OMEGA_MCP_LOG: path.join(dir, 'log') },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const pending = new Map(); let id = 0;
@@ -256,7 +256,7 @@ test('advertised description documents the real ref contract', () => {
 const wire = (env) => {
   const dir = mkdtempSync(path.join(tmpdir(), 'omega-flow-cap-'));
   const child = spawn(process.execPath, [new URL('./server.mjs', import.meta.url).pathname], {
-    env: { ...process.env, OMEGA_MCP_LOG: path.join(dir, 'log'), ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, OMEGA_FLOW: '1', OMEGA_MCP_LOG: path.join(dir, 'log'), ...env }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const pending = new Map(); let id = 0;
   const lines = createInterface({ input: child.stdout });

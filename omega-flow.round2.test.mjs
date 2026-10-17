@@ -99,7 +99,7 @@ test('invalid await plans are rejected before an earlier effect; control fields 
 test('real MCP wire executes batch once, awaits it, and verifies actual stdout', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'omega-flow-round2-'));
   const child = spawn(process.execPath, [new URL('./server.mjs', import.meta.url).pathname], {
-    env: { ...process.env, OMEGA_FLOW_ALLOW_EFFECTS: '1', OMEGA_MCP_LOG: path.join(dir, 'log') },
+    env: { ...process.env, OMEGA_FLOW: '1', OMEGA_FLOW_ALLOW_EFFECTS: '1', OMEGA_MCP_LOG: path.join(dir, 'log') },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let id = 0; const pending = new Map();

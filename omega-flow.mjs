@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { awaitBatch, flowError } from './omega-flow-wait.mjs';
 
-const READ = new Set(['omega_read', 'omega_grep', 'omega_guard_check', 'omega_health',
-  'omega_quota', 'omega_sqlite', 'omega_batch_status', 'artifact_read', 'artifact_search']);
+const READ = new Set(['omega_read', 'omega_grep', 'omega_health',
+  'omega_sqlite', 'omega_batch_status', 'artifact', 'artifact_read', 'artifact_search']);
 const EFFECT = new Set(['omega_edit', 'omega_undo', 'omega_batch', 'omega_batch_cancel']);
 const BAD = new Set(['__proto__', 'prototype', 'constructor']);
 const MAX_BYTES = 256_000;

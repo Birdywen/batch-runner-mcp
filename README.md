@@ -26,66 +26,80 @@ opencode (`opencode.json`, `mcp` section):
 { "batch-runner": { "type": "local", "command": ["npx", "-y", "github:Birdywen/batch-runner-mcp"] } }
 ```
 
-Then call `omega_health` once. The first line is the verdict (`HEALTHY` / `DEGRADED`); optional parts that are not configured show as `[--]`.
+Then call `omega_health` once. The first line is the verdict (`HEALTHY` / `DEGRADED`); optional parts that are missing show as `[--]`.
 
 ## Example
 
 ```json
 { "steps": [
   { "label": "build", "command_line": "npm run build", "expect": { "contains": ["compiled successfully"] } },
-  { "label": "smoke", "command_line": "node dist/cli.js --version", "expect": { "regex": "^\\d+\\.\\d+" } }
+  { "label": "smoke", "command_line": "node dist/cli.js --version", "env": { "NO_COLOR": "1" }, "expect": { "regex": "^\\d+\\.\\d+" } }
 ], "stopOnError": true }
 ```
 
-`omega_batch` returns a job id at once; `omega_batch_status` with `waitMs` (max 50000) blocks until the verdict is ready:
+`omega_batch` waits for the verdict (up to `waitMs`, default 45s) and answers in the same call. Success is one line:
 
 ```
-batch job-xxxx: partial 4/4
-  [FAIL] 1. basic exit3 (process)
-      exit=3 signal=none timedOut=false chars=34
-      out-line
-      --- stderr ---
-      err-line
-  [FAIL] 2. expect fail on exit0 (expectation) -- expect.contains failed: NOPE_MARK
-  [ok] 3. long 30000
-  [ok] 4. after
+batch job-xxxx: success 2/2 (3.1s): build | smoke
 ```
 
-Add `format: "json"` for structured per-step fields (`ok`, `status`, `failureType`, `exitCode`, `signal`, `timedOut`, `durationMs`) and `verbose: true` for full output.
+A failure shows the exit code and the **tail** of the output, where errors are:
+
+```
+batch job-xxxx: failed 1/2 (0.4s)
+  [FAIL] 1. build (process)
+      exit=2
+      src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.
+  [--] 2. (halted) -- stopOnError
+```
+
+- `expect` is checked against the **full** output. Output over 4000 chars goes to an `artifact://` ref.
+- Still running after `waitMs`: the reply has the job id; `omega_batch_status {id, waitMs}` picks it up. `cancel: true` kills the running step's process group.
+- Job state is on disk after every step; after a restart an unfinished job reads as `interrupted`.
+- `format: "json"` gives structured per-step fields; `verbose: true` adds output.
 
 ## Tools
 
+Nine tools, about 1.8k tokens of schema in total.
+
 | Tool | What it does |
 |---|---|
-| `omega_batch` / `omega_batch_status` / `omega_batch_cancel` | Async batch of bash steps with expect checks, status polling and cancellation |
-| `omega_flow` | Multi-step flows with conditions (see `OMEGA-FLOW.md`) |
-| `omega_guard_check` | Dry-run the command guard that inspects steps before they run |
-| `omega_read` | Read files |
-| `omega_edit` / `omega_undo` | Exact-string edits with snapshot-based undo |
-| `vfs_local_write` | Write a file without shell quoting |
-| `omega_grep` | ripgrep search, with a `grep -E` fallback when rg is absent |
-| `omega_sqlite` | Read-only queries against any sqlite file |
-| `artifact_read` / `artifact_search` | Long outputs are stored as artifacts; read or search them later |
-| `omega_health` | Self-check: module hashes, writable dirs, optional dependencies |
-| `omega_quota` | Optional; needs `OMEGA_QUOTA_SCRIPT` |
-| `db_query` | Optional; tied to a specific agent database layout. Use `omega_sqlite` for general sqlite access |
+| `omega_batch` | Bash steps with expect checks; verdict in one call |
+| `omega_batch_status` | Wait for / cancel a batch that outlived `waitMs` |
+| `omega_read` | Many files in one call: slices, regex-filtered lines, outlines |
+| `omega_grep` | path:line search (rg, `grep -E` fallback) |
+| `omega_edit` | Multi-file exact-string edits, all-or-nothing; short summary + undo id; `undo:"<id>"` rolls back |
+| `vfs_local_write` | Atomic file write without shell quoting |
+| `omega_sqlite` | Read-only SQL on any sqlite file |
+| `artifact` | Long output: regex lines with context, a slice, or the last 80 lines |
+| `omega_health` | Self-check |
+
+`omega_flow` (multi-step tool composition, see `OMEGA-FLOW.md`) is off by default; set `OMEGA_FLOW=1` to advertise it.
 
 ## Configuration
 
-Everything works with defaults under `~/.omega-mcp/`. Common overrides:
+Everything works with defaults. Common overrides:
 
 | Variable | Default / meaning |
 |---|---|
 | `OMEGA_ARTIFACT_DIR` | `~/.omega-mcp/artifacts` |
-| `OMEGA_JOB_DIR` | batch job state directory |
-| `OMEGA_MCP_LOG` | server log file |
-| `OMEGA_INLINE_LIMIT` | output size kept inline before spilling to an artifact |
-| `OMEGA_DEFAULT_TIMEOUT` | default per-step timeout |
+| `OMEGA_JOB_DIR` | `/tmp/omega-jobs` — batch job state |
+| `OMEGA_SNAP_DIR` | `/tmp/omega-snaps` — omega_edit undo snapshots |
+| `OMEGA_MCP_LOG` | `/tmp/omega-mcp.log` |
+| `OMEGA_INLINE_LIMIT` | 20000 — output kept inline before spilling to an artifact |
+| `OMEGA_DEFAULT_TIMEOUT` | 120000 ms per step |
 | `OMEGA_CWD` | default working directory (home if unset) |
-| `OMEGA_QUOTA_SCRIPT` | enables `omega_quota` |
+| `OMEGA_FLOW=1` | advertise omega_flow (limits: see `OMEGA-FLOW.md`) |
+| `OMEGA_FORCE_GREP` | `1` pins omega_grep to the grep fallback |
+
+Batch shells get `/opt/homebrew/bin` and `/usr/local/bin` prepended to PATH; a per-step `env.PATH` still wins.
 
 ## Development
 
 ```bash
 npm test
 ```
+
+The MCP server loads code once at startup: restart the host after changing it.
+
+omega_grep keeps rg and the grep fallback in step: the fallback uses ERE (so `a|b` works) and passes exactly one matcher flag (GNU grep rejects `-E -F`). `OMEGA_GREP_TRACE=1` dumps the argv so the suite can assert on it.
