@@ -55,6 +55,9 @@ batch job-xxxx: failed 1/2 (0.4s)
 
 - `expect` is checked against the **full** output. Output over 4000 chars goes to an `artifact://` ref.
 - Still running after `waitMs`: the reply has the job id; `omega_batch_status {id, waitMs}` picks it up. `cancel: true` kills the running step's process group.
+- Long jobs: submit with `waitMs: 0`, then run `node bin/forge-wait.mjs <jobId>` as a host background command; it exits with the verdict (0 = pass), waking the agent without polling. Raise the wait cap for hosts with long tool timeouts via `OMEGA_MAX_WAIT_MS` / `OMEGA_DEFAULT_WAIT_MS`; the tool descriptions state the configured values. Job files are written atomically, so `forge-wait` never reads half a file.
+- `cleanup: true` on the batch stops whatever the steps left running in the background (e.g. `nohup next dev &`) when the job ends; the verdict line says `[cleanup: stopped background processes of N step(s)]`. Off by default, because some steps start services on purpose.
+- `omega_edit` misses say where the text nearly matched: `matches ignoring whitespace at line 12 (indent: you have "   ", file has "  ")`, or the line where it diverges, so the edit can be fixed without re-reading the file.
 - Job state is on disk after every step; after a restart an unfinished job reads as `interrupted`.
 - `format: "json"` gives structured per-step fields; `verbose: true` adds output.
 

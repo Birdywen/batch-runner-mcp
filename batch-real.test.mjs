@@ -96,6 +96,22 @@ const json = async (id, waitMs = 10000) => JSON.parse((await omegaBatchStatus({ 
   assert.match(c.text, /cancelled/);
 }
 
+// 6b. Full-output refs sit right under the verdict line (hosts truncate the end
+//     of a long result), for one-line, show and verbose verdicts alike.
+{
+  const ref = /^  full step 1: artifact:\/\/\S+ \(\d+ chars\)$/;
+  const plain = await omegaBatch({ steps: [{ label: 'big', command_line: 'seq 1 3000' }] }, runProcess);
+  assert.match(plain.text.split('\n')[1], ref, plain.text.slice(0, 300));
+  const shown = await omegaBatch({ steps: [{ label: 'big', command_line: 'seq 1 3000', show: true }] }, runProcess);
+  const sl = shown.text.split('\n');
+  assert.match(sl[1], ref, shown.text.slice(0, 300));
+  assert.match(sl[2], /^--- 1 big \(cut; full: artifact:\/\/\S+\) ---$/);
+  const verbose = await omegaBatch({ steps: [{ label: 'big', command_line: 'seq 1 3000' }], verbose: true }, runProcess);
+  assert.match(verbose.text.split('\n')[1], ref, verbose.text.slice(0, 300));
+  const small = await omegaBatch({ steps: [{ label: 's', command_line: 'echo hi', show: true }] }, runProcess);
+  assert.ok(!small.text.includes('full step'), small.text);
+}
+
 // 7. omega_edit: applied edits answer in a few lines; undo via the same tool.
 {
   const { omegaEdit } = await import('./tools-ext.mjs');
@@ -123,6 +139,29 @@ const json = async (id, waitMs = 10000) => JSON.parse((await omegaBatchStatus({ 
   assert.match(tail.text, /2999: 2999\n3000: 3000/);
   const hit = await callTool('artifact', { ref: j.results[0].artifact, regex: '^1500$', context: 0 });
   assert.match(hit.text, /^1 match\(es\)[\s\S]*1500: 1500/);
+}
+
+// 9. Bridge to host background tasks: a separate process (bin/forge-wait.mjs)
+//    blocks on a job owned by this process and exits with its verdict.
+{
+  const { spawn } = await import('node:child_process');
+  const wait = (id) => new Promise((resolve) => {
+    const p = spawn('node', [path.join(path.dirname(new URL(import.meta.url).pathname), 'bin/forge-wait.mjs'), id], { env: { ...process.env, OMEGA_JOB_DIR: jobDir } });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', (code) => resolve({ code, out }));
+  });
+  const t0 = Date.now();
+  const okId = await start({ steps: [{ label: 'slow', command_line: 'sleep 3; echo BRIDGE_OK', show: true }] });
+  const ok = await wait(okId);
+  assert.equal(ok.code, 0, ok.out);
+  assert.match(ok.out, /success 1\/1[\s\S]*BRIDGE_OK/);
+  assert.ok(Date.now() - t0 >= 2500, 'waiter must block until the job finishes, not read a running job as final');
+  const badId = await start({ steps: [{ label: 'bad', command_line: 'echo BRIDGE_ERR >&2; exit 4' }] });
+  const bad = await wait(badId);
+  assert.equal(bad.code, 1);
+  assert.match(bad.out, /exit=4[\s\S]*BRIDGE_ERR/);
+  assert.equal((await wait('job-does-not-exist')).code, 2);
 }
 
 console.log('batch-real: all passed');

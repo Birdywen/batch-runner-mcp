@@ -7,9 +7,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs && node batch-real.test.mjs && node tools-ext.greptt.test.mjs && node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs",
+    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs && node batch-real.test.mjs && node tools-ext.greptt.test.mjs && node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs && node batch-show-retry.test.mjs && node batch-cases.test.mjs && node batch-validate.test.mjs && node batch-files.test.mjs && node edit-diff.test.mjs && node upgrade-v2.test.mjs",
+    "bench": "node scripts/bench.mjs",
     "test:guard": "node batch-guard.test.mjs",
-    "test:tools": "node tools-ext.test.mjs && node tools-ext.greptt.test.mjs && node batch-real.test.mjs",
+    "test:tools": "node tools-ext.test.mjs && node tools-ext.greptt.test.mjs && node batch-real.test.mjs && node batch-show-retry.test.mjs && node batch-cases.test.mjs && node batch-validate.test.mjs && node batch-files.test.mjs && node edit-diff.test.mjs && node upgrade-v2.test.mjs",
     "test:flow": "node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs"
   },
   "bin": {

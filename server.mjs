@@ -123,6 +123,7 @@ function runProcess(args) {
         exitCode: code,
         signal: signal || null,
         timedOut,
+        pgid: child.pid,
       });
     });
 

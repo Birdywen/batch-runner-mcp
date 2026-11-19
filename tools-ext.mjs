@@ -197,8 +197,13 @@ const jobs = new Map();
 const activeKills = new Map(); // jobId -> kill() for the running step
 const JOB_DIR = process.env.OMEGA_JOB_DIR || '/tmp/omega-jobs';
 const STEP_INLINE = 4000;
-const BATCH_WAIT_DEFAULT = 45000;
+// The wait cap protects hosts with a short MCP tool timeout (~60s). Hosts with a
+// long one (Claude Code's is hours) can raise both via env so one call covers a
+// long job instead of many polls.
+const BATCH_WAIT_MAX = Math.max(1000, Number(process.env.OMEGA_MAX_WAIT_MS) || 50000);
+const BATCH_WAIT_DEFAULT = Math.min(BATCH_WAIT_MAX, Number(process.env.OMEGA_DEFAULT_WAIT_MS) || 45000);
 const FAIL_TAIL_LINES = 12;
+const HEARTBEAT_MS = 2000;
 
 // Failure view: the end of the output is where errors are, so show the tail.
 function failTail(text) {
@@ -208,15 +213,103 @@ function failTail(text) {
     .trimEnd();
   if (!body) return [];
   const ls = body.split('\n');
-  const out = ls.length > FAIL_TAIL_LINES ? ['...', ...ls.slice(-FAIL_TAIL_LINES)] : ls;
-  return out.map((l) => (l.length > 200 ? `${l.slice(0, 200)}...` : l));
+  const clip = (l) => (l.length > 200 ? `${l.slice(0, 200)}...` : l);
+  // The first real error is usually at the TOP of a compiler/vitest log, while
+  // the tail is boilerplate. Lead with those lines so a 12-line tail window
+  // cannot hide the one line that says what broke.
+  const ERR = /(error|Error|ERROR|FAIL|Failed|Traceback|Exception|panic:)/;
+  const hits = [];
+  for (let i = 0; i < ls.length && hits.length < 5; i++) {
+    if (ERR.test(ls[i]) && !hits.some((h) => h.i === i)) hits.push({ i, l: ls[i] });
+  }
+  const tail = ls.length > FAIL_TAIL_LINES ? ls.slice(-FAIL_TAIL_LINES) : ls;
+  const tailStart = ls.length - tail.length;
+  const lead = hits.filter((h) => h.i < tailStart);
+  const out = [];
+  if (lead.length) {
+    out.push('first error(s):');
+    for (const h of lead) out.push(`  ${h.i + 1}: ${clip(h.l)}`);
+  }
+  if (out.length) out.push('tail:');
+  out.push(...tail.map(clip));
+  return out;
+}
+
+// Success view for show:true steps: last 40 lines of output, long lines clipped.
+function showTail(text) {
+  const body = String(text || '')
+    .replace(/^\[truncated\][\s\S]*?\n\n/, '')
+    .replace(/^exit=\S+ signal=\S+ timedOut=\S+ chars=\d+\n?/m, '')
+    .trimEnd();
+  if (!body) return [];
+  const ls = body.split('\n');
+  return (ls.length > 40 ? ['...', ...ls.slice(-40)] : ls).map((l) => (l.length > 300 ? `${l.slice(0, 300)}...` : l));
+}
+
+// show:true = tail (where the result usually is), show:"head" = the summary /
+// header, show:"all" = everything. Unknown values are a config error, not a
+// silent no-op -- `show:"yes"` used to drop the output with no warning.
+const SHOW_MODES = new Set(['tail', 'head', 'all']);
+function showMode(step) {
+  if (step.show === true) return 'tail';
+  if (typeof step.show === 'string' && SHOW_MODES.has(step.show)) return step.show;
+  if (step.show === false || step.show === undefined) return null;
+  return 'invalid';
+}
+function showPart(text, mode) {
+  if (mode === true) mode = 'tail';
+  if (mode === 'all') return String(text || '').trimEnd().split('\n').map((l) => (l.length > 300 ? `${l.slice(0, 300)}...` : l));
+  if (mode === 'head') {
+    const body = String(text || '').trimEnd();
+    if (!body) return [];
+    const ls = body.split('\n');
+    return (ls.length > 40 ? [...ls.slice(0, 40), '...'] : ls).map((l) => (l.length > 300 ? `${l.slice(0, 300)}...` : l));
+  }
+  return showTail(text);
 }
 
 function persistJob(job) {
   try {
     mkdirSync(JOB_DIR, { recursive: true });
-    writeFileSync(path.join(JOB_DIR, `${job.id}.json`), JSON.stringify(job, null, 1));
+    // atomic: write a temp file then rename, so a reader (forge-wait) never sees half a file
+    const dst = path.join(JOB_DIR, `${job.id}.json`), tmp = `${dst}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(job, null, 1)); renameSync(tmp, dst);
   } catch { /* best effort */ }
+}
+
+// A hint for an omega_edit miss, so the caller can fix the edit without re-reading the file:
+// a whitespace-only difference (indentation, tabs), or the first line where the text diverges.
+export function nearMiss(text, old) {
+  const lines = text.split('\n');
+  const want = old.split('\n');
+  const lineAt = (idx) => text.slice(0, idx).split('\n').length;
+  const squash = (s) => s.replace(/\s+/g, ' ').trim();
+  const first = want.find((l) => l.trim()) ?? '';
+  if (!first.trim()) return '';
+  const k = want.indexOf(first);
+  const lead = (s) => s.match(/^[ \t]*/)[0];
+  const show = (s) => JSON.stringify(s.length > 120 ? `${s.slice(0, 117)}...` : s);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== first.trim()) continue;
+    const start = i - k;
+    if (start < 0) continue;
+    const got = lines.slice(start, start + want.length);
+    if (got.length === want.length && squash(got.join('\n')) === squash(old)) {
+      const j = want.findIndex((w, n) => w !== got[n]);
+      const ws = lead(want[j]) !== lead(got[j])
+        ? `indent: you have ${JSON.stringify(lead(want[j]))}, file has ${JSON.stringify(lead(got[j]))}`
+        : `file line is ${show(got[j])}`;
+      return `; matches ignoring whitespace at line ${start + 1}, first difference at line ${start + 1 + j} (${ws})`;
+    }
+    let j = 0;
+    while (j < want.length && got[j] === want[j]) j++;
+    if (j >= 1 || lines[i].trim() === first.trim()) {
+      const at = start + 1 + j;
+      return `; first line found at line ${i + 1}, diverges at line ${at}: file has ${show(lines[at - 1] ?? '<end of file>')}, you have ${show(want[j] ?? '')}`;
+    }
+  }
+  const flat = squash(text).indexOf(squash(first));
+  return flat < 0 ? '; first line not found anywhere in the file' : '';
 }
 
 function loadJob(id) {
@@ -224,17 +317,20 @@ function loadJob(id) {
   if (live) return live;
   const f = path.join(JOB_DIR, `${id}.json`);
   if (!existsSync(f)) return null;
-  const job = JSON.parse(readFileSync(f, 'utf8'));
+  let job;
+  try { job = JSON.parse(readFileSync(f, 'utf8')); }
+  catch { return { id, state: 'running', results: [], done: 0, total: 0, started: new Date().toISOString(), note: 'job file unreadable this tick (being written); retrying' }; }
   // A "running" job on disk that this process does not own was cut off by a
   // restart: it will never finish, so say so instead of polling forever.
-  if (job.state === 'running') {
+  const fresh = Date.now() - (job.heartbeat || 0) < HEARTBEAT_MS * 5;
+  if (job.state === 'running' && !fresh) {
     job.state = 'interrupted';
     job.note = 'server restarted while this job was running; steps after the last recorded one did not complete';
   }
   return job;
 }
 
-function checkExpect(e, out) {
+function checkExpect(e, out, cwd) {
   const has = (s) => out.includes(s);
   const list = (v) => (Array.isArray(v) ? v : [v]);
   if (e.contains && !list(e.contains).every(has)) {
@@ -250,7 +346,96 @@ function checkExpect(e, out) {
       return ['configuration', `expect.regex invalid: ${err.message}`];
     }
   }
+  // count: how many times a pattern occurs, optionally requiring an exact
+  // number. `wc -l`-style output is the common case: a bare `contains: [" 42 "]`
+  // cannot tell 42 lines from 420 lines.
+  if (e.count) {
+    // A bare string means "occurs at least once".
+    const spec = typeof e.count === 'string' ? { regex: e.count, min: 1 } : e.count;
+    const src = spec.regex || spec.contains;
+    if (!src) return ['configuration', 'expect.count needs a regex or contains'];
+    let n;
+    try {
+      n = spec.regex
+        ? (out.match(new RegExp(spec.regex, 'gm')) || []).length
+        : out.split(spec.contains).length - 1;
+    } catch (err) {
+      return ['configuration', `expect.count regex invalid: ${err.message}`];
+    }
+    const want = spec.equals !== undefined ? spec.equals : spec.min;
+    if (spec.equals !== undefined && n !== spec.equals) {
+      return ['expectation', `expect.count failed: found ${n}, want exactly ${spec.equals}`];
+    }
+    if (spec.min !== undefined && n < spec.min) {
+      return ['expectation', `expect.count failed: found ${n}, want >= ${spec.min}`];
+    }
+    if (spec.max !== undefined && n > spec.max) {
+      return ['expectation', `expect.count failed: found ${n}, want <= ${spec.max}`];
+    }
+    if (want === undefined && spec.max === undefined) {
+      return ['configuration', 'expect.count needs equals, min or max'];
+    }
+  }
+  // maxLines: catches a command that floods the log where the old behaviour
+  // only saw "exit 0" and called it a pass.
+  if (e.maxLines !== undefined) {
+    const n = out.length ? out.trimEnd().split('\n').length : 0;
+    if (n > e.maxLines) return ['expectation', `expect.maxLines failed: ${n} lines, want <= ${e.maxLines}`];
+  }
+  // files: outputs the step must have produced (screenshots, builds). A path, or {path, minBytes}
+  // (default 1 byte, so an empty file is a miss). Relative paths resolve against the step cwd.
+  if (e.files) {
+    const bad = [];
+    for (const f of list(e.files)) {
+      const p = typeof f === 'string' ? f : f && f.path;
+      const min = typeof f === 'object' && Number.isInteger(f.minBytes) ? f.minBytes : 1;
+      let size = -1;
+      try { size = statSync(path.resolve(cwd || process.cwd(), p)).size; } catch { /* missing */ }
+      if (size < 0) bad.push(`${p} (missing)`);
+      else if (size < min) bad.push(`${p} (${size} bytes, want >= ${min})`);
+    }
+    if (bad.length) return ['expectation', `expect.files failed: ${bad.join(', ')}`];
+  }
   return null;
+}
+
+// batch-level files: small helper scripts or inputs written into a per-job dir (env OMEGA_FILES in
+// every step), removed when the job ends. Replaces heredoc + cp + rm chains.
+function validateFiles(files) {
+  if (files === undefined) return null;
+  if (!Array.isArray(files) || files.length > 16) return 'refused: files must be an array of at most 16 {path, content}; nothing was run.';
+  for (const f of files) {
+    if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') return 'refused: each file needs string path and content; nothing was run.';
+    if (!f.path || path.isAbsolute(f.path) || f.path.split('/').includes('..')) return `refused: file path must be relative without ".." (got ${JSON.stringify(f.path)}); nothing was run.`;
+    if (f.content.length > 1_000_000) return `refused: file ${f.path} is over 1 MB; nothing was run.`;
+  }
+  return null;
+}
+
+// Reject bad step config BEFORE any step runs, so a typo in step 5 cannot leave
+// steps 1-4 already executed with side effects.
+function validateSteps(steps) {
+  const problems = [];
+  steps.forEach((st, i) => {
+    const at = `step ${i + 1}${st && st.label ? ` (${st.label})` : ''}`;
+    if (!st || typeof st !== 'object') { problems.push(`${at}: must be an object`); return; }
+    if (typeof st.command_line !== 'string' || !st.command_line.trim()) problems.push(`${at}: command_line is required`);
+    if (showMode(st) === 'invalid') problems.push(`${at}: show must be true, false, "tail", "head" or "all" (got ${JSON.stringify(st.show)})`);
+    const e = st.expect;
+    if (!e) return;
+    const rx = (label, src) => { try { new RegExp(src, 'm'); } catch (err) { problems.push(`${at}: ${label} invalid: ${err.message}`); } };
+    if (e.regex) rx('expect.regex', e.regex);
+    if (e.count) {
+      const spec = typeof e.count === 'string' ? { regex: e.count, min: 1 } : e.count;
+      if (!spec || typeof spec !== 'object' || !(spec.regex || spec.contains)) problems.push(`${at}: expect.count needs a regex or contains`);
+      else {
+        if (spec.regex) rx('expect.count regex', spec.regex);
+        if (spec.equals === undefined && spec.min === undefined && spec.max === undefined) problems.push(`${at}: expect.count needs equals, min or max`);
+        for (const k of ['equals', 'min', 'max']) if (spec[k] !== undefined && !Number.isInteger(spec[k])) problems.push(`${at}: expect.count.${k} must be an integer`);
+      }
+    }
+  });
+  return problems.length ? `refused: invalid batch, nothing was run.\n  ${problems.slice(0, 8).join('\n  ')}` : null;
 }
 
 export function omegaBatch(args, runProcess) {
@@ -263,14 +448,34 @@ export function omegaBatch(args, runProcess) {
   if (!Array.isArray(steps) || !steps.length) {
     return Promise.resolve({ isError: true, text: 'steps must be a non-empty array' });
   }
+  const invalid = validateSteps(steps) || validateFiles(args.files);
+  if (invalid) return Promise.resolve({ isError: true, text: invalid });
   const id = `job-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const job = {
     id, pid: process.pid, total: steps.length, done: 0, started: new Date().toISOString(),
     state: 'running', results: [], stopOnError: args.stopOnError !== false,
     cancelRequested: false, current: null,
   };
+  // cleanup:true -> at job end, stop whatever the steps left running in the background
+  // (a `nohup server &` stays in its step's process group). Opt-in: some steps start
+  // services on purpose.
+  const leftGroups = new Set();
+  let filesDir = null;
+  if (Array.isArray(args.files) && args.files.length) {
+    filesDir = path.join(JOB_DIR, `${id}.files`);
+    for (const f of args.files) {
+      const dst = path.join(filesDir, f.path);
+      mkdirSync(path.dirname(dst), { recursive: true });
+      writeFileSync(dst, f.content, { mode: 0o700 });
+    }
+  }
   jobs.set(id, job);
+  // Heartbeat: other processes (e.g. bin/forge-wait.mjs) tell a live job from one
+  // cut off by a restart by how recently the owner wrote this.
+  job.heartbeat = Date.now();
   persistJob(job);
+  const beat = setInterval(() => { job.heartbeat = Date.now(); persistJob(job); }, HEARTBEAT_MS);
+  beat.unref();
 
   (async () => {
     for (let i = 0; i < steps.length; i++) {
@@ -284,31 +489,55 @@ export function omegaBatch(args, runProcess) {
       }
       const step = steps[i];
       const label = step.label || step.command_line?.slice(0, 60) || `step${i + 1}`;
+      const mode = showMode(step);
+      if (mode === 'invalid') {
+        job.results.push({
+          i: i + 1, label, ok: false, status: 'failed', failureType: 'configuration',
+          note: `show must be true, false, "tail", "head" or "all" (got ${JSON.stringify(step.show)})`,
+          text: '', durationMs: 0,
+        });
+        job.state = 'failed';
+        if (i + 1 < steps.length) {
+          job.results.push({
+            i: i + 2, label: '(halted)', ok: false, status: 'skipped',
+            failureType: 'halted', note: 'configuration', text: '', durationMs: 0,
+          });
+        }
+        break;
+      }
       const stepStarted = Date.now();
       job.current = { i: i + 1, label, startedAt: new Date(stepStarted).toISOString() };
       persistJob(job);
       try {
-        const r = await runProcess({
-          command_line: step.command_line,
-          timeout: step.timeout,
-          cwd: step.cwd,
-          stdin: step.stdin,
-          environment: step.env,
-          inlineLimit: STEP_INLINE,
-          onSpawn: (kill) => activeKills.set(id, kill),
-        });
-        activeKills.delete(id);
-        // Assertions run on the FULL output, not the truncated preview: a
-        // marker in the middle of a long log must still count.
-        const full = r.full ?? r.text;
-        let ok = !r.isError;
-        let note = '';
-        let failureType = ok ? null : 'process';
-        if (job.cancelRequested && !ok) { failureType = 'cancelled'; note = 'killed by cancel'; }
-        if (ok && step.expect) {
-          const miss = checkExpect(step.expect, full);
-          if (miss) { ok = false; [failureType, note] = miss; }
-        }
+        // Optional retries (0..3) for flaky steps; never retried after a cancel or a bad config.
+        const maxTry = 1 + Math.min(3, Math.max(0, Number.isInteger(step.retries) ? step.retries : 0));
+        let r, ok, note, failureType, attempts = 0;
+        do {
+          attempts++;
+          r = await runProcess({
+            command_line: step.command_line,
+            timeout: step.timeout,
+            cwd: step.cwd,
+            stdin: step.stdin,
+            environment: filesDir ? { ...step.env, OMEGA_FILES: filesDir } : step.env,
+            inlineLimit: STEP_INLINE,
+            onSpawn: (kill) => activeKills.set(id, kill),
+          });
+          activeKills.delete(id);
+          if (r.pgid) leftGroups.add(r.pgid);
+          // Assertions run on the FULL output, not the truncated preview: a
+          // marker in the middle of a long log must still count.
+          const full = r.full ?? r.text;
+          ok = !r.isError;
+          note = '';
+          failureType = ok ? null : 'process';
+          if (job.cancelRequested && !ok) { failureType = 'cancelled'; note = 'killed by cancel'; }
+          if (ok && step.expect) {
+            const miss = checkExpect(step.expect, full, step.cwd);
+            if (miss) { ok = false; [failureType, note] = miss; }
+          }
+        } while (!ok && attempts < maxTry && !job.cancelRequested && failureType !== 'configuration');
+        if (attempts > 1) note = `${note ? `${note}; ` : ''}attempts=${attempts}`;
         job.results.push({
           i: i + 1,
           label,
@@ -316,8 +545,11 @@ export function omegaBatch(args, runProcess) {
           status: ok ? 'passed' : 'failed',
           failureType,
           note,
+          show: mode === 'tail' ? true : mode,
           text: r.text.slice(0, STEP_INLINE),
           artifact: r.artifactRef || null,
+          fullChars: r.full ? r.full.length : null,
+          fullRef: r.full && r.full.length > STEP_INLINE ? r.artifactRef || null : null,
           durationMs: Date.now() - stepStarted,
           exitCode: r.exitCode ?? r.code ?? null,
           signal: r.signal ?? null,
@@ -345,18 +577,30 @@ export function omegaBatch(args, runProcess) {
       }
       persistJob(job);
     }
+    if (args.cleanup === true && leftGroups.size) {
+      const alive = (g) => { try { process.kill(-g, 0); return true; } catch { return false; } };
+      const live = [...leftGroups].filter(alive);
+      for (const g of live) { try { process.kill(-g, 'SIGTERM'); } catch {} }
+      if (live.length) {
+        await new Promise((res) => setTimeout(res, 1500));
+        for (const g of live.filter(alive)) { try { process.kill(-g, 'SIGKILL'); } catch {} }
+        job.cleanupNote = `stopped background processes of ${live.length} step(s)`;
+      }
+    }
     if (job.state === 'running') {
       job.state = job.results.every((r) => r.ok) ? 'success' : 'partial';
     }
+    if (filesDir) { try { rmSync(filesDir, { recursive: true, force: true }); } catch { /* best effort */ } }
     job.current = null;
     job.finished = new Date().toISOString();
+    clearInterval(beat);
     persistJob(job);
   })();
 
   // Default: wait for the verdict so one call does submit + result.
-  const wait = args.waitMs === undefined ? BATCH_WAIT_DEFAULT : Math.min(50000, Math.max(0, Number(args.waitMs) || 0));
+  const wait = args.waitMs === undefined ? BATCH_WAIT_DEFAULT : Math.min(BATCH_WAIT_MAX, Math.max(0, Number(args.waitMs) || 0));
   if (wait) {
-    return omegaBatchStatus({ id, waitMs: wait, format: args.format }).then((r) => ({ ...r, data: { jobId: id } }));
+    return omegaBatchStatus({ id, waitMs: wait, format: args.format, verbose: args.verbose }).then((r) => ({ ...r, data: { jobId: id } }));
   }
   return Promise.resolve({
     isError: false,
@@ -374,18 +618,29 @@ export function omegaBatchStatus(args) {
     if (c.isError) return c;
     return omegaBatchStatus({ id, waitMs: Math.max(Number(args.waitMs) || 0, 5000), format: args.format });
   }
-  // waitMs blocks so a caller gets the verdict in ONE call. Capped below the
-  // usual 60s host MCP timeout so the reply is never lost.
-  const waitMs = Math.min(50000, Math.max(0, Number(args.waitMs) || 0));
+  // waitMs blocks so a caller gets the verdict in ONE call (capped by BATCH_WAIT_MAX).
+  const waitMs = Math.min(BATCH_WAIT_MAX, Math.max(0, Number(args.waitMs) || 0));
   const render = (job) => {
     if (!job) return null;
     const isError = FAILED_STATES.has(job.state);
     if (args.format === 'json') return { isError, text: JSON.stringify(job, null, 2) };
     const took = job.finished ? ` (${((Date.parse(job.finished) - Date.parse(job.started)) / 1000).toFixed(1)}s)` : '';
-    const head = `batch ${job.id}: ${job.state} ${job.done}/${job.total}${took}`;
+    const head = `batch ${job.id}: ${job.state} ${job.done}/${job.total}${took}${job.cleanupNote ? ` [cleanup: ${job.cleanupNote}]` : ''}`;
     // Success costs one line: the labels are enough to confirm what ran.
+    const shown = job.results.filter((r) => r.show && r.ok);
+    // Full-output refs go right under the head line: hosts that truncate a long
+    // result keep its start, so a ref at the end would be the first thing lost.
+    const refLines = job.results.filter((r) => r.fullRef).map((r) => `  full step ${r.i}: ${r.fullRef} (${r.fullChars} chars)`);
+    if (job.state === 'success' && !args.verbose && shown.length) {
+      const out = [`${head}: ${job.results.map((r) => r.label).join(' | ')}`.slice(0, 600), ...refLines];
+      for (const r of shown) out.push(`--- ${r.i} ${r.label}${r.fullRef ? ` (cut; full: ${r.fullRef})` : ''} ---`, ...showPart(r.text, r.show));
+      return { isError: false, text: out.join('\n') };
+    }
     if (job.state === 'success' && !args.verbose) {
-      return { isError: false, text: `${head}: ${job.results.map((r) => r.label).join(' | ')}`.slice(0, 600) };
+      const line = `${head}: ${job.results.map((r) => r.label).join(' | ')}`.slice(0, 600);
+      // A one-line success must still tell you where the full output went,
+      // otherwise a 900-line result is unreachable without re-running.
+      return { isError: false, text: [line, ...refLines].join('\n') };
     }
     const lines = [head];
     if (job.note) lines.push(`  note: ${job.note}`);
@@ -403,11 +658,12 @@ export function omegaBatchStatus(args) {
     if (job.state === 'running' && job.current) {
       const secs = Math.round((Date.now() - Date.parse(job.current.startedAt)) / 1000);
       lines.push(`  [..] ${job.current.i}. ${job.current.label} (running ${secs}s)`);
-      lines.push(`  wait more: omega_batch_status {"id":"${job.id}","waitMs":45000}`);
+      lines.push(`  wait more: omega_batch_status {"id":"${job.id}","waitMs":${BATCH_WAIT_MAX}}`);
     }
     if (args.verbose) {
+      lines.splice(1, 0, ...refLines);
       for (const r of job.results) {
-        lines.push(`--- step ${r.i} ${r.label} ---`, r.text.slice(0, 3000));
+        lines.push(`--- step ${r.i} ${r.label}${r.fullRef ? ` (cut; full: ${r.fullRef})` : ''} ---`, r.text.slice(0, 3000));
       }
     }
     return { isError, text: lines.join('\n') };
@@ -992,6 +1248,19 @@ function spanDiff(newText, spans, ctx = 3) {
     while (lo < hi) { const m = (lo + hi) >> 1; if (starts[m] <= pos) lo = m + 1; else hi = m; }
     return Math.max(0, lo - 1);
   };
+  // Whole original lines for a span: the unchanged text before/after it on its lines
+  // plus oldStr, so "-" and "+" compare like with like.
+  const oldLinesOf = (sp) => {
+    const a0 = lineOf(sp.at);
+    const endPos = sp.len > 0 ? sp.at + sp.len - 1 : sp.at;
+    const a1 = lineOf(endPos);
+    const lineEnd = a1 + 1 < starts.length ? starts[a1 + 1] - 1 : newText.length;
+    const pre = newText.slice(starts[a0], sp.at);
+    const post = sp.at + sp.len < lineEnd ? newText.slice(sp.at + sp.len, lineEnd) : '';
+    let t = pre + sp.oldStr + post;
+    if (t.endsWith('\n')) t = t.slice(0, -1);
+    return t.split('\n');
+  };
   const ranges = spans.map((s) => {
     const endPos = s.len > 0 ? s.at + s.len - 1 : s.at;
     return {
@@ -1018,9 +1287,9 @@ function spanDiff(newText, spans, ctx = 3) {
       const sp = byLine.get(l);
       if (sp && !emittedOld.has(sp)) {
         emittedOld.add(sp);
-        for (const ol of sp.oldStr.split('\n')) out.push(`- ${ol.slice(0, 500)}`);
+        for (const ol of oldLinesOf(sp)) out.push(`- ${ol.slice(0, 500)}`);
       }
-      out.push(`${sp ? '+' : '  '}${(lines[l] ?? '').slice(0, 500)}`);
+      out.push(`${sp ? '+ ' : '  '}${(lines[l] ?? '').slice(0, 500)}`);
     }
     return out.join('\n');
   });
@@ -1129,7 +1398,7 @@ export function omegaEdit(args) {
     const newString = args.preserveLineEndings === false ? e.newString : normalizeLineEndings(e.newString, entry.eol);
     if (e.oldString === newString) { fail('oldString and normalized newString are identical (no-op)'); continue; }
     const hits = text.split(e.oldString).length - 1;
-    if (hits === 0) { fail('oldString not found (0 matches)'); continue; }
+    if (hits === 0) { fail(`oldString not found (0 matches)${nearMiss(text, e.oldString)}`); continue; }
     if (hits > 1 && !e.replaceAll) { fail(`oldString matches ${hits} times, refusing to guess (pass replaceAll:true to replace every occurrence)`); continue; }
     const at = text.indexOf(e.oldString);
     // Overlap guard (same-file chaining): warn when this match lands inside a
@@ -1339,10 +1608,11 @@ const d = (schema, description) => ({ ...schema, description });
 export const EXTRA_TOOLS = [
   {
     name: 'omega_batch',
-    description: 'Run bash steps in sequence; each may assert on its output (expect), so exit=0 is not taken as success. '
-      + 'Waits up to waitMs (default 45000) and returns the verdict in this call; if still running, returns the job id for omega_batch_status. '
-      + 'Success is one line; failures show exit code and output tail. Output over 4000 chars goes to an artifact:// ref; expect sees the full text. '
-      + 'Steps writing via >, tee or dd outside /tmp are refused.',
+    description: 'Run bash steps in sequence; expect asserts on output/files, so exit=0 is not success. '
+      + `Waits up to waitMs (default ${BATCH_WAIT_DEFAULT}, max ${BATCH_WAIT_MAX} ms) for the verdict, else returns a job id for omega_batch_status. `
+      + 'cleanup:true stops background processes left by steps. '
+      + 'Success is one line (show:true or verbose adds output); failures show exit code and tail. Output over 4000 chars goes to artifact:// (ref on line 2); expect sees it all. '
+      + 'Writes outside /tmp are refused.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1356,6 +1626,8 @@ export const EXTRA_TOOLS = [
               cwd: S,
               timeout: d(S, '"30s", "5m" or ms; default 120s'),
               stdin: d(S, 'piped to stdin; avoids shell quoting'),
+              show: d(B, 'include this step output in a success verdict (saves a verbose status call)'),
+              retries: d(I, 'rerun a failing step up to N more times (0..3) for flaky commands'),
               env: { type: 'object', additionalProperties: S },
               expect: {
                 type: 'object',
@@ -1363,21 +1635,27 @@ export const EXTRA_TOOLS = [
                   contains: d(SA, 'all must appear; use a token printed only on success'),
                   notContains: SA,
                   regex: S,
+                  count: d({ type: 'object' }, '{regex|contains, equals|min|max}'),
+                  maxLines: I,
+                  files: d({ type: 'array' }, 'paths or {path,minBytes} that must exist'),
                 },
               },
             },
             required: ['command_line'],
           },
         },
+        files: d({ type: 'array' }, '[{path,content}] in $OMEGA_FILES, removed at end'),
         stopOnError: d(B, 'default true'),
-        waitMs: d(I, 'default 45000, max 50000; 0 returns at once'),
+        verbose: d(B, 'include every step output in the verdict'),
+        waitMs: d(I, `default ${BATCH_WAIT_DEFAULT}, max ${BATCH_WAIT_MAX}; 0 returns at once`),
+        cleanup: d(B, 'stop background processes left by the steps when the job ends'),
       },
       required: ['steps'],
     },
   },
   {
     name: 'omega_batch_status',
-    description: 'Verdict of an omega_batch job; waitMs (max 50000) blocks until done. cancel:true kills the running step and stops the job.',
+    description: `Verdict of an omega_batch job; waitMs (max ${BATCH_WAIT_MAX} ms here) blocks until done. cancel:true kills the running step and stops the job.`,
     inputSchema: {
       type: 'object',
       properties: {
